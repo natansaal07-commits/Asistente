@@ -1303,18 +1303,37 @@
 
   /* ---------- almacén ---------- */
   var colas = {};
+  function guardarSoloLocal(col, id, datos) {
+    var path = col + "/" + id;
+    var prev = colas[path] || Promise.resolve();
+    var next = prev.catch(function () {}).then(function () {
+      if (!S.db) { return; }
+      return datos ? S.db.doc(path).set(datos) : S.db.doc(path).delete();
+    });
+    colas[path] = next; return next;
+  }
   function escribir(path, datos) {
     var prev = colas[path] || Promise.resolve();
     var next = prev.catch(function () {}).then(function () {
       if (!S.db) { throw new Error("sin almacen"); }
       return S.db.doc(path).set(datos);
     });
-    colas[path] = next; return next;
+    colas[path] = next;
+    var pz = path.split("/");
+    if (pz[0] === "items" || pz[0] === "personas") {
+      next.then(function () { return subirUno(pz[0], pz[1], datos, false); }).catch(function () {});
+    }
+    return next;
   }
   function borrarDoc(path) {
     var prev = colas[path] || Promise.resolve();
     var next = prev.catch(function () {}).then(function () { return S.db.doc(path).delete(); });
-    colas[path] = next; return next;
+    colas[path] = next;
+    var pz = path.split("/");
+    if (pz[0] === "items" || pz[0] === "personas") {
+      next.then(function () { return subirUno(pz[0], pz[1], { id: pz[1], actualizado: new Date().toISOString() }, true); }).catch(function () {});
+    }
+    return next;
   }
   function codigo(e) { return (e && e.code) ? e.code : (e && e.message ? e.message : "desconocido"); }
   function guardarItem(it, evento) {
@@ -2290,8 +2309,9 @@
       bn.appendChild(bw);
       main.appendChild(bn);
     }
+    banderaNube(main);
     var dsc = diasSinCopia();
-    if (dsc === null || dsc >= 7) {
+    if (!nubeActiva() && (dsc === null || dsc >= 7)) {
       var cb = el("div", "banner warn");
       cb.style.cursor = "pointer";
       cb.innerHTML = ic("descarga", "sm");
@@ -2793,7 +2813,10 @@
   function pie() {
     var f = el("div", "foot");
     var tot = S.items.size + S.personas.size;
-    f.textContent = "Versión de prueba · " + S.items.size + " anotaciones y actividades · " + S.personas.size + " personas · Todo se guarda en este teléfono y solo en este teléfono. No hay copia de seguridad automática: guardá una copia cada tanto desde el menú.";
+    var dondeTxt = nubeActiva()
+      ? "Respaldo automático activado (" + (SB.user.email || "tu cuenta") + ")." + (ultimaSincro() ? " Última sincronización: " + fmtCuando(ultimaSincro()) + "." : "")
+      : "Todo se guarda en este dispositivo y solo acá. Activá el respaldo automático desde el menú.";
+    f.textContent = "Versión de prueba · " + S.items.size + " anotaciones y actividades · " + S.personas.size + " personas · " + dondeTxt;
     main.appendChild(f);
   }
 
@@ -3300,6 +3323,255 @@
     });
   }
 
+
+  /* ================= NUBE: respaldo automático y sincronización ================= */
+  var SB = {
+    url: "https://kwghmfkjlvyngzhkcmyw.supabase.co",
+    key: "sb_publishable_3-AOoBuWFdgbu2lfYrm7sg_FUmOocbC",
+    cli: null, user: null, estado: "apagado", ultimoError: null, sincronizando: false
+  };
+  var COLAS_NUBE = "ao-pendientes";
+
+  function pendientes() {
+    try { return JSON.parse(localStorage.getItem(COLAS_NUBE) || "[]"); } catch (e) { return []; }
+  }
+  function marcarPendiente(col, id) {
+    try {
+      var p = pendientes();
+      var k = col + "/" + id;
+      if (p.indexOf(k) < 0) { p.push(k); localStorage.setItem(COLAS_NUBE, JSON.stringify(p.slice(-2000))); }
+    } catch (e) {}
+  }
+  function limpiarPendiente(col, id) {
+    try {
+      var p = pendientes().filter(function (x) { return x !== col + "/" + id; });
+      localStorage.setItem(COLAS_NUBE, JSON.stringify(p));
+    } catch (e) {}
+  }
+
+  function nubeActiva() { return !!(SB.cli && SB.user); }
+
+  async function nubeArrancar() {
+    if (!SB.url || SB.url.indexOf("http") !== 0) { SB.estado = "sin-configurar"; return; }
+    SB.estado = "conectando";
+    try {
+      var mod = await import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm");
+      SB.cli = mod.createClient(SB.url, SB.key, {
+        auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, flowType: "pkce", storageKey: "ao-sesion" }
+      });
+    } catch (e) {
+      SB.estado = "sin-internet"; render(); return;
+    }
+    try {
+      var r = await SB.cli.auth.getSession();
+      SB.user = (r.data && r.data.session) ? r.data.session.user : null;
+    } catch (e) { SB.user = null; }
+    SB.cli.auth.onAuthStateChange(function (ev, s) {
+      SB.user = s ? s.user : null;
+      if (SB.user) { SB.estado = "conectado"; sincronizar(true); suscribirNube(); }
+      else { SB.estado = "desconectado"; }
+      render();
+    });
+    try {
+      if (location.hash.indexOf("access_token") >= 0 || location.search.indexOf("code=") >= 0) {
+        history.replaceState(null, "", location.pathname);
+      }
+    } catch (e) {}
+    SB.estado = SB.user ? "conectado" : "desconectado";
+    render();
+    if (SB.user) { await sincronizar(true); suscribirNube(); }
+  }
+
+  function filaNube(col, id, datos, borrado) {
+    return {
+      id: id,
+      user_id: SB.user.id,
+      datos: borrado ? { id: id } : datos,
+      actualizado: (datos && datos.actualizado) || new Date().toISOString(),
+      borrado: !!borrado
+    };
+  }
+
+  async function subirUno(col, id, datos, borrado) {
+    if (!nubeActiva()) { marcarPendiente(col, id); return false; }
+    try {
+      var r = await SB.cli.from(col).upsert(filaNube(col, id, datos, borrado), { onConflict: "user_id,id" });
+      if (r.error) { throw r.error; }
+      limpiarPendiente(col, id);
+      return true;
+    } catch (e) {
+      SB.ultimoError = (e && e.message) || "error";
+      marcarPendiente(col, id);
+      return false;
+    }
+  }
+
+  async function subirPendientes() {
+    if (!nubeActiva()) { return; }
+    var p = pendientes();
+    for (var i = 0; i < p.length; i++) {
+      var pz = p[i].split("/"), col = pz[0], id = pz[1];
+      if (!col || !id) { continue; }
+      var mapa = col === "items" ? S.items : col === "personas" ? S.personas : null;
+      if (!mapa) { limpiarPendiente(col, id); continue; }
+      var d = mapa.get(id);
+      await subirUno(col, id, d || { id: id }, !d);
+    }
+  }
+
+  function aplicarDeNube(col, fila) {
+    var mapa = col === "items" ? S.items : S.personas;
+    var local = mapa.get(fila.id);
+    if (fila.borrado) {
+      if (local) { mapa.delete(fila.id); guardarSoloLocal(col, fila.id, null); }
+      return true;
+    }
+    var remoto = fila.datos || {};
+    var tl = local && local.actualizado ? String(local.actualizado) : "";
+    var tr = remoto.actualizado ? String(remoto.actualizado) : String(fila.actualizado || "");
+    if (tl && tr && tl >= tr) { return false; }
+    remoto.id = fila.id;
+    mapa.set(fila.id, remoto);
+    guardarSoloLocal(col, fila.id, remoto);
+    return true;
+  }
+
+  async function sincronizar(completo) {
+    if (!nubeActiva() || SB.sincronizando) { return; }
+    SB.sincronizando = true;
+    try {
+      await subirPendientes();
+      var cambios = 0;
+      for (var ci = 0; ci < 2; ci++) {
+        var col = ci === 0 ? "items" : "personas";
+        var r = await SB.cli.from(col).select("id,datos,actualizado,borrado");
+        if (r.error) { throw r.error; }
+        var vistos = {};
+        (r.data || []).forEach(function (f) {
+          vistos[f.id] = 1;
+          if (aplicarDeNube(col, f)) { cambios++; }
+        });
+        if (completo) {
+          var mapa = col === "items" ? S.items : S.personas;
+          var locales = Array.from(mapa.keys());
+          for (var j = 0; j < locales.length; j++) {
+            if (!vistos[locales[j]]) { await subirUno(col, locales[j], mapa.get(locales[j]), false); cambios++; }
+          }
+        }
+      }
+      SB.ultimoError = null;
+      marcarSincro();
+      if (cambios) { render(); }
+    } catch (e) {
+      SB.ultimoError = (e && e.message) || "error";
+    }
+    SB.sincronizando = false;
+    render();
+  }
+
+  function marcarSincro() {
+    try { localStorage.setItem("ao-ultima-sincro", new Date().toISOString()); } catch (e) {}
+  }
+  function ultimaSincro() {
+    try { return localStorage.getItem("ao-ultima-sincro"); } catch (e) { return null; }
+  }
+
+  var canalNube = null;
+  function suscribirNube() {
+    if (!nubeActiva() || canalNube) { return; }
+    try {
+      canalNube = SB.cli.channel("ao-" + SB.user.id)
+        .on("postgres_changes", { event: "*", schema: "public", table: "items", filter: "user_id=eq." + SB.user.id },
+          function (p) { if (p["new"] && aplicarDeNube("items", p["new"])) { render(); } })
+        .on("postgres_changes", { event: "*", schema: "public", table: "personas", filter: "user_id=eq." + SB.user.id },
+          function (p) { if (p["new"] && aplicarDeNube("personas", p["new"])) { render(); } })
+        .subscribe();
+    } catch (e) {}
+  }
+
+  /* ---------- entrar con el mail ---------- */
+  function pantallaEntrar() {
+    abrirSheet("Respaldo automático", function (b, foot) {
+      if (SB.user) {
+        var ok = el("div", "banner ok");
+        ok.style.cursor = "default";
+        ok.innerHTML = ic("check", "sm");
+        var w0 = el("div");
+        w0.appendChild(el("strong", null, "Respaldo activado"));
+        w0.appendChild(el("span", null, "Entraste como " + (SB.user.email || "vos") + ". Todo lo que anotás se guarda solo, y aparece igual en tus otros dispositivos."));
+        ok.appendChild(w0);
+        b.appendChild(ok);
+        var us = ultimaSincro();
+        b.appendChild(el("p", "hint", us ? "Última sincronización: " + fmtCuando(us) : "Sincronizando…"));
+        var sal = el("button", "btn danger", "Salir de esta cuenta");
+        sal.onclick = async function () {
+          if (!confirm("Vas a salir.\n\nLo que ya está anotado queda en este teléfono, pero deja de guardarse solo.\n\n¿Seguimos?")) { return; }
+          try { await SB.cli.auth.signOut(); } catch (e) {}
+          canalNube = null; cerrarSheet(); render();
+        };
+        pie7(foot, sal);
+        var list = el("button", "btn primary", "Listo");
+        list.onclick = cerrarSheet;
+        pie7(foot, list);
+        return;
+      }
+      b.appendChild(el("p", "hint", "Poné tu mail y te mandamos un correo con un botón para entrar. Lo tocás una vez y listo: desde ahí todo se guarda solo y lo ves igual en el celular y en la computadora."));
+      var mi = el("input"); mi.type = "email"; mi.id = "sb-mail";
+      mi.placeholder = "tumail@ejemplo.com";
+      mi.setAttribute("autocapitalize", "off"); mi.setAttribute("autocorrect", "off");
+      mi.inputMode = "email";
+      campo(b, "Tu mail", mi);
+      var est = el("p", "hint", ""); b.appendChild(est);
+
+      var bEnv = el("button", "btn primary");
+      bEnv.innerHTML = ic("check", "sm") + "<span>Mandame el correo</span>";
+      bEnv.onclick = async function () {
+        var mail = mi.value.trim();
+        if (!mail || mail.indexOf("@") < 0) { est.className = "hint err"; est.textContent = "Escribí un mail válido."; mi.focus(); return; }
+        if (!SB.cli) { est.className = "hint err"; est.textContent = "Sin conexión. Probá de nuevo cuando tengas internet."; return; }
+        est.className = "hint"; est.textContent = "Mandando…";
+        bEnv.disabled = true;
+        try {
+          var r = await SB.cli.auth.signInWithOtp({
+            email: mail,
+            options: { shouldCreateUser: true, emailRedirectTo: location.origin + location.pathname }
+          });
+          if (r.error) { throw r.error; }
+          est.className = "hint";
+          est.textContent = "Listo. Te mandamos un correo a " + mail + ". Abrilo desde ESTE MISMO navegador y tocá el botón para entrar. Puede tardar un minuto; mirá también el correo no deseado.";
+          bEnv.innerHTML = "<span>Volver a mandar</span>";
+          bEnv.disabled = false;
+        } catch (e) {
+          est.className = "hint err";
+          est.textContent = "No se pudo mandar: " + ((e && e.message) || "error");
+          bEnv.disabled = false;
+        }
+      };
+      pie7(foot, bEnv);
+
+      var bCer = el("button", "btn", "Cerrar");
+      bCer.onclick = cerrarSheet;
+      pie7(foot, bCer);
+    });
+  }
+
+  function banderaNube(main2) {
+    if (SB.estado === "sin-configurar") { return; }
+    if (nubeActiva()) { return; }
+    var bn = el("div", "banner warn");
+    bn.style.cursor = "pointer";
+    bn.innerHTML = ic("descarga", "sm");
+    var w = el("div");
+    w.appendChild(el("strong", null, "Guardado solo en este dispositivo"));
+    w.appendChild(el("span", null, "Tocá acá para activar el respaldo automático y ver lo mismo en el celular y en la computadora."));
+    bn.appendChild(w);
+    bn.onclick = pantallaEntrar;
+    main2.appendChild(bn);
+  }
+
+  window.addEventListener("online", function () { if (nubeActiva()) { sincronizar(false); } });
+  setInterval(function () { if (nubeActiva() && !S.sheet) { sincronizar(false); } }, 120000);
+
   /* ---------- volver a cargar una copia guardada ---------- */
   function importar() {
     abrirSheet("Restaurar una copia", function (b, foot) {
@@ -3365,6 +3637,7 @@
         ["Guardar una copia de todo", "descarga", function () { cerrarSheet(); exportar(); }],
         ["Restaurar una copia", "caja", function () { importar(); }],
         ["Copias automáticas", "reloj", function () { verRespaldos(); }],
+        ["Respaldo automático y sincronización", "caja", function () { pantallaEntrar(); }],
         [S.tema === "dark" ? "Cambiar a modo claro" : "Cambiar a modo oscuro", S.tema === "dark" ? "sol" : "luna", function () { aplicarTema(S.tema === "dark" ? "light" : "dark"); cerrarSheet(); }]
       ].forEach(function (o) {
         var bb = el("button", "btn full");
@@ -3436,7 +3709,7 @@
     var okI = false, okP = false;
     function listoQuiza() {
       if (S.listo) { render(); return; }
-      if (okI && okP) { S.listo = true; render(); revisarVencidas(); setTimeout(respaldoDelDia, 1500); }
+      if (okI && okP) { S.listo = true; render(); revisarVencidas(); setTimeout(respaldoDelDia, 1500); setTimeout(nubeArrancar, 300); }
     }
     db.collection("items").onSnapshot(function (snap) {
       S.items = new Map();
